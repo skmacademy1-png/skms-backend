@@ -402,6 +402,8 @@ const ORIGINS = new Set([
   'http://localhost:5173',
   'http://localhost:5174',
   'https://skms-frontend.vercel.app',
+  'https://drskmacademy.com',
+  'https://admin.drskmacademy.com',
 ]);
 if (PROD && !env.CLIENT_URL && !env.ADMIN_URL) console.warn('[cors] CLIENT_URL / ADMIN_URL not set — browsers on the deployed front ends will be refused');
 

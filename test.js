@@ -50,6 +50,8 @@ const server = require('./server').listen(0, async () => {
     assert.equal(await cors('https://skms.example'), 'https://skms.example');
     assert.equal(await cors('https://admin.skms.example'), 'https://admin.skms.example');
     assert.equal(await cors('http://localhost:5173'), 'http://localhost:5173');
+    assert.equal(await cors('https://drskmacademy.com'), 'https://drskmacademy.com');
+    assert.equal(await cors('https://admin.drskmacademy.com'), 'https://admin.drskmacademy.com');
     assert.equal(await cors('https://evil.example'), null);
     const pre = await fetch(base + '/api/admin/login', { method: 'OPTIONS', headers: { Origin: 'https://skms.example' } });
     assert.equal(pre.headers.get('access-control-allow-credentials'), 'true');
