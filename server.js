@@ -86,6 +86,8 @@ function pgStore(connectionString) {
     END $$;
     ALTER TABLE web_users ADD COLUMN IF NOT EXISTS is_subscribed boolean NOT NULL DEFAULT false;
     CREATE TABLE IF NOT EXISTS web_reviews (id text PRIMARY KEY, data jsonb NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+    -- Job Enquiry / Guidance Request forms; kind is 'job' or 'guidance'
+    CREATE TABLE IF NOT EXISTS web_enquiries (id text PRIMARY KEY, kind text NOT NULL, data jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
     -- Razorpay verification details on the app's own (Prisma-owned) subscriptions table. Additive only: IF EXISTS
     -- skips it on a database without the app tables, IF NOT EXISTS leaves any column the app already defines alone.
     ALTER TABLE IF EXISTS subscriptions
@@ -224,6 +226,9 @@ function pgStore(connectionString) {
     delReview: id => q('DELETE FROM web_reviews WHERE id = $1', [id]),
     putReview: r => q('INSERT INTO web_reviews (id, data, status) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET data = $2, status = $3', [r.id, JSON.stringify(r), r.status]),
     listSubmissions: async () => (await q('SELECT data FROM web_reviews ORDER BY created_at DESC LIMIT 500')).map(r => r.data),
+    // DO NOTHING: a re-sent form (double click, retry after a timeout) carries the same id and is stored once
+    putEnquiry: e => q('INSERT INTO web_enquiries (id, kind, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [e.id, e.kind, JSON.stringify(e)]),
+    listEnquiries: async kind => (await q('SELECT data FROM web_enquiries WHERE kind = $1 ORDER BY created_at DESC LIMIT 1000', [kind])).map(r => r.data),
   };
 }
 
@@ -276,6 +281,8 @@ function fileStore(file) {
     putReview: r => write(d => { (d.reviews ??= {})[r.id] = r; }),
     delReview: id => write(d => { delete d.reviews?.[id]; }),
     listSubmissions: async () => Object.values((await load()).reviews || {}).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+    putEnquiry: e => write(d => { (d.enquiries ??= {})[e.id] ??= e; }),
+    listEnquiries: async kind => Object.values((await load()).enquiries || {}).filter(e => e.kind === kind).sort((a, b) => String(b.date).localeCompare(String(a.date))),
   };
 }
 
@@ -401,8 +408,10 @@ const ORIGINS = new Set([
   ...originList(env.ADMIN_URL),
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:5175',   // Vite moves the admin here when 5174 is already taken
   'https://skms-frontend.vercel.app',
   'https://drskmacademy.com',
+  'https://www.drskmacademy.com',
   'https://admin.drskmacademy.com',
 ]);
 if (PROD && !env.CLIENT_URL && !env.ADMIN_URL) console.warn('[cors] CLIENT_URL / ADMIN_URL not set — browsers on the deployed front ends will be refused');
@@ -414,7 +423,7 @@ app.use('/api', (req, res, next) => {
   if (origin && ORIGINS.has(origin)) res.set({
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Max-Age': '86400',
   });
@@ -639,6 +648,59 @@ app.delete('/api/admin/review-inbox/:id', requireAdmin, async (req, res) => {
   await db.delReview(req.params.id);
   res.json({ ok: true });
 });
+/* Job Enquiry (hero button) and Guidance Request (Contact page) forms. Public: submit only — nothing is ever read back
+   publicly. Admin: the two lists. Stored on the primary store directly, never the /tmp fallback: a lead saved to a disk
+   that is wiped on the next deploy is a lead lost, so a database outage answers 503 and the visitor can retry.
+   [field, label, rule]: a number = max length, 'phone' = 7–15 digits, 'years' = 0–60, 'multi' = up to 1000 chars, newlines kept */
+const ENQUIRY = {
+  job: [['name', 'full name', 80], ['qualification', 'qualification', 120], ['experience', 'years of experience', 'years'],
+    ['phone', 'contact number', 'phone'], ['whatsapp', 'WhatsApp number', 'phone'], ['specialization', 'qualified field / medical specialization', 120]],
+  guidance: [['name', 'full name', 80], ['qualification', 'qualification', 120], ['phone', 'contact number', 'phone'],
+    ['whatsapp', 'WhatsApp number', 'phone'], ['requirement', 'guidance requirement', 'multi']],
+};
+// → { data } or { error }; control characters are stripped, single-line fields have their whitespace collapsed
+function cleanEnquiry(kind, body) {
+  const data = {};
+  for (const [key, label, rule] of ENQUIRY[kind]) {
+    let v = String(body?.[key] ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ');
+    v = (rule === 'multi' ? v.replace(/[ \t]+/g, ' ') : v.replace(/\s+/g, ' ')).trim();
+    const n = Number(v);
+    if (rule === 'phone') v = v.replace(/[\s().-]/g, '');
+    const ok = rule === 'phone' ? /^\+?\d{7,15}$/.test(v)
+      : rule === 'years' ? v !== '' && Number.isFinite(n) && n >= 0 && n <= 60
+      : v.length > 0 && v.length <= (rule === 'multi' ? 1000 : rule);
+    if (!ok) return { error: `Please enter a valid ${label}` };
+    data[key] = rule === 'years' ? n : v;
+  }
+  return { data };
+}
+const enquiryKind = (req, res, next) => ENQUIRY[req.params.kind] ? next() : res.status(404).json({ error: 'Not found' });
+
+app.post('/api/enquiries/:kind', enquiryKind, async (req, res) => {
+  const key = 'enquiry:' + req.ip;
+  if (blocked(key)) return res.status(429).json(TOO_MANY);
+  const { data, error } = cleanEnquiry(req.params.kind, req.body);
+  if (error) return res.status(400).json({ error });
+  strike(key);   // 5 enquiries per IP, then a 15-minute pause
+  // the form sends one random id per fill-in, so a double submit or a retry after a timeout is stored once
+  const id = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.body?.id) ? req.body.id.toLowerCase() : crypto.randomUUID();
+  try {
+    await primary.putEnquiry({ id, kind: req.params.kind, ...data, date: new Date().toISOString() });
+  } catch (err) {
+    console.error('[enquiry] save failed:', err.message);
+    return res.status(503).json({ error: 'We could not send your enquiry just now — please try again in a minute.' });
+  }
+  res.status(201).json({ ok: true });
+});
+app.get('/api/admin/enquiries/:kind', requireAdmin, enquiryKind, async (req, res) => {
+  try {
+    res.json(await primary.listEnquiries(req.params.kind));
+  } catch (err) {
+    console.error('[enquiry] list failed:', err.message);
+    res.status(503).json({ error: 'The database is unreachable — try again in a minute.' });
+  }
+});
+
 app.get('/api/admin/reviews', requireAdmin, async (req, res) => res.json(await readReviews()));
 app.put('/api/admin/reviews', requireAdmin, (req, res) => saveReviews(res, req.body));
 app.post('/api/admin/reviews', requireAdmin, async (req, res) => saveReviews(res, [...await readReviews(), req.body]));

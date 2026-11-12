@@ -50,12 +50,30 @@ const server = require('./server').listen(0, async () => {
     assert.equal(await cors('https://skms.example'), 'https://skms.example');
     assert.equal(await cors('https://admin.skms.example'), 'https://admin.skms.example');
     assert.equal(await cors('http://localhost:5173'), 'http://localhost:5173');
+    assert.equal(await cors('http://localhost:5174'), 'http://localhost:5174');
+    assert.equal(await cors('http://localhost:5175'), 'http://localhost:5175', 'the admin dev server when 5174 is taken');
     assert.equal(await cors('https://drskmacademy.com'), 'https://drskmacademy.com');
+    assert.equal(await cors('https://www.drskmacademy.com'), 'https://www.drskmacademy.com');
     assert.equal(await cors('https://admin.drskmacademy.com'), 'https://admin.drskmacademy.com');
     assert.equal(await cors('https://evil.example'), null);
-    const pre = await fetch(base + '/api/admin/login', { method: 'OPTIONS', headers: { Origin: 'https://skms.example' } });
-    assert.equal(pre.headers.get('access-control-allow-credentials'), 'true');
-    assert.match(pre.headers.get('access-control-allow-headers'), /Authorization/);
+    assert.equal(await cors('http://localhost:5176'), null, 'only the listed dev ports');
+    // the admin login preflight, exactly as a browser sends it, from every admin origin
+    for (const origin of ['https://skms.example', 'https://admin.drskmacademy.com', 'http://localhost:5175']) {
+      const pre = await fetch(base + '/api/admin/login', { method: 'OPTIONS', headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type,authorization' } });
+      assert.equal(pre.status, 204);
+      assert.equal(pre.headers.get('access-control-allow-origin'), origin, 'the origin itself, never *');
+      assert.equal(pre.headers.get('access-control-allow-credentials'), 'true');
+      assert.match(pre.headers.get('access-control-allow-headers'), /Content-Type, Authorization/);
+      for (const m of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']) assert.match(pre.headers.get('access-control-allow-methods'), new RegExp(`\\b${m}\\b`));
+    }
+    // an unknown origin gets no CORS headers at all, so the browser blocks it
+    const evil = await fetch(base + '/api/admin/login', { method: 'OPTIONS', headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'POST' } });
+    assert.equal(evil.headers.get('access-control-allow-origin'), null);
+    assert.equal(evil.headers.get('access-control-allow-credentials'), null);
+    // the real (non-preflight) response carries the header too, or the browser drops the login answer
+    const real = await fetch(base + '/api/admin/login', { method: 'POST', headers: { Origin: 'http://localhost:5175', 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(real.status, 401);
+    assert.equal(real.headers.get('access-control-allow-origin'), 'http://localhost:5175');
 
     // auth
     assert.equal((await call('/api/cms/faqs', { body: '[]' }, 'PUT'))[0], 401);
@@ -118,6 +136,30 @@ const server = require('./server').listen(0, async () => {
     assert.equal((await call(`/api/admin/review-inbox/${inbox[0].id}`, { headers: auth }, 'DELETE'))[0], 200);
     assert.deepEqual((await call('/api/admin/review-inbox', { headers: auth }))[1], []);
     assert.equal((await call(`/api/admin/review-inbox/${inbox[0].id}`, { headers: auth }, 'DELETE'))[0], 404);
+
+    // Job Enquiry / Guidance Request: public submit, admin-only read, validated, a re-sent form stored once
+    const job = { name: ' Dr  Asha ', qualification: 'MBBS', experience: '3', phone: '+91 96055 00678', whatsapp: '9605500678', specialization: 'General Practice — DHA' };
+    const guide = { name: 'Dr Ravi', qualification: 'MBBS', phone: '9605500678', whatsapp: '9605500678', requirement: 'Which exam first?\nDHA or MOH' };
+    assert.equal((await call('/api/enquiries/nope', { body: json(job) }))[0], 404);
+    assert.deepEqual(await call('/api/enquiries/job', { body: json({ ...job, phone: '12' }) }), [400, { error: 'Please enter a valid contact number' }]);
+    assert.equal((await call('/api/enquiries/job', { body: json({ ...job, experience: '' }) }))[0], 400, 'experience is required');
+    assert.equal((await call('/api/enquiries/job', { body: json({ ...job, experience: '61' }) }))[0], 400);
+    assert.equal((await call('/api/enquiries/job', { body: json({ ...job, specialization: ' ' }) }))[0], 400);
+    assert.equal((await call('/api/enquiries/guidance', { body: json({ ...guide, requirement: '' }) }))[0], 400);
+    const once = crypto.randomUUID();
+    assert.deepEqual(await call('/api/enquiries/job', { body: json({ ...job, id: once }) }), [201, { ok: true }], 'nothing is echoed back');
+    assert.equal((await call('/api/enquiries/job', { body: json({ ...job, id: once, name: 'Changed' }) }))[0], 201, 'a retry still succeeds…');
+    assert.equal((await call('/api/enquiries/guidance', { body: json(guide) }))[0], 201);
+    assert.equal((await call('/api/admin/enquiries/job'))[0], 401);
+    assert.equal((await call('/api/admin/enquiries/guidance', { headers: { Authorization: `Bearer ${token}x` } }))[0], 401);
+    const [, jobs] = await call('/api/admin/enquiries/job', { headers: auth });
+    assert.equal(jobs.length, 1, '…but is stored once, and never overwrites');
+    assert.deepEqual({ ...jobs[0], id: 0, date: 0 }, { id: 0, date: 0, kind: 'job', name: 'Dr Asha', qualification: 'MBBS', experience: 3, phone: '+919605500678', whatsapp: '9605500678', specialization: 'General Practice — DHA' });
+    assert.ok(!Number.isNaN(Date.parse(jobs[0].date)));
+    const [, guides] = await call('/api/admin/enquiries/guidance', { headers: auth });
+    assert.deepEqual(guides.map(g => [g.kind, g.requirement]), [['guidance', 'Which exam first?\nDHA or MOH']], 'each list holds only its own kind');
+    assert.equal((await call('/api/admin/enquiries/nope', { headers: auth }))[0], 404);
+    assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).enquiries[once], 'saved to the store, so it survives a restart');
 
     // student OTP login (no mail key outside production → the code comes back as devOtp)
     assert.equal((await call('/api/auth/otp', { body: json({ email: 'bad' }) }))[0], 400);
