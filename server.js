@@ -651,19 +651,21 @@ app.delete('/api/admin/review-inbox/:id', requireAdmin, async (req, res) => {
 /* Job Enquiry (hero button) and Guidance Request (Contact page) forms. Public: submit only — nothing is ever read back
    publicly. Admin: the two lists. Stored on the primary store directly, never the /tmp fallback: a lead saved to a disk
    that is wiped on the next deploy is a lead lost, so a database outage answers 503 and the visitor can retry.
-   [field, label, rule]: a number = max length, 'phone' = 7–15 digits, 'years' = 0–60, 'multi' = up to 1000 chars, newlines kept */
+   [field, label, rule, optional]: a number = max length, 'phone' = 7–15 digits, 'years' = 0–60, 'multi' = up to 1000 chars, newlines kept */
+const JOB_FIELDS = [['name', 'full name', 80], ['qualification', 'qualification', 120], ['experience', 'years of experience', 'years'],
+  ['phone', 'contact number', 'phone'], ['specialization', 'qualified field / medical specialization', 120]];
 const ENQUIRY = {
-  job: [['name', 'full name', 80], ['qualification', 'qualification', 120], ['experience', 'years of experience', 'years'],
-    ['phone', 'contact number', 'phone'], ['whatsapp', 'WhatsApp number', 'phone'], ['specialization', 'qualified field / medical specialization', 120]],
-  guidance: [['name', 'full name', 80], ['qualification', 'qualification', 120], ['phone', 'contact number', 'phone'],
-    ['whatsapp', 'WhatsApp number', 'phone'], ['requirement', 'guidance requirement', 'multi']],
+  job: JOB_FIELDS,
+  // the same student details as a job enquiry, plus an optional short message
+  guidance: [...JOB_FIELDS, ['requirement', 'guidance requirement', 'multi', true]],
 };
 // → { data } or { error }; control characters are stripped, single-line fields have their whitespace collapsed
 function cleanEnquiry(kind, body) {
   const data = {};
-  for (const [key, label, rule] of ENQUIRY[kind]) {
+  for (const [key, label, rule, optional] of ENQUIRY[kind]) {
     let v = String(body?.[key] ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ');
     v = (rule === 'multi' ? v.replace(/[ \t]+/g, ' ') : v.replace(/\s+/g, ' ')).trim();
+    if (optional && !v) { data[key] = ''; continue; }
     const n = Number(v);
     if (rule === 'phone') v = v.replace(/[\s().-]/g, '');
     const ok = rule === 'phone' ? /^\+?\d{7,15}$/.test(v)

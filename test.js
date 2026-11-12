@@ -138,26 +138,34 @@ const server = require('./server').listen(0, async () => {
     assert.equal((await call(`/api/admin/review-inbox/${inbox[0].id}`, { headers: auth }, 'DELETE'))[0], 404);
 
     // Job Enquiry / Guidance Request: public submit, admin-only read, validated, a re-sent form stored once
-    const job = { name: ' Dr  Asha ', qualification: 'MBBS', experience: '3', phone: '+91 96055 00678', whatsapp: '9605500678', specialization: 'General Practice — DHA' };
-    const guide = { name: 'Dr Ravi', qualification: 'MBBS', phone: '9605500678', whatsapp: '9605500678', requirement: 'Which exam first?\nDHA or MOH' };
+    const jobBase = { name: ' Dr  Asha ', qualification: 'MBBS', experience: '3', phone: '+91 96055 00678', specialization: 'General Practice — DHA' };
+    // an old cached page may still send whatsapp: accepted, but never stored (checked in the saved record below)
+    const job = { ...jobBase, whatsapp: '9605500678' };
+    const guide = { ...jobBase, name: 'Dr Ravi', requirement: 'Which exam first?\nDHA or MOH' };   // the same details as a job enquiry + a message
     assert.equal((await call('/api/enquiries/nope', { body: json(job) }))[0], 404);
     assert.deepEqual(await call('/api/enquiries/job', { body: json({ ...job, phone: '12' }) }), [400, { error: 'Please enter a valid contact number' }]);
     assert.equal((await call('/api/enquiries/job', { body: json({ ...job, experience: '' }) }))[0], 400, 'experience is required');
     assert.equal((await call('/api/enquiries/job', { body: json({ ...job, experience: '61' }) }))[0], 400);
     assert.equal((await call('/api/enquiries/job', { body: json({ ...job, specialization: ' ' }) }))[0], 400);
-    assert.equal((await call('/api/enquiries/guidance', { body: json({ ...guide, requirement: '' }) }))[0], 400);
+    for (const k of ['experience', 'specialization', 'phone']) assert.equal((await call('/api/enquiries/guidance', { body: json({ ...guide, [k]: '' }) }))[0], 400, `guidance needs ${k} too`);
+    assert.equal((await call('/api/enquiries/guidance', { body: json({ ...guide, requirement: 'x'.repeat(1001) }) }))[0], 400, 'the optional message is still capped');
     const once = crypto.randomUUID();
     assert.deepEqual(await call('/api/enquiries/job', { body: json({ ...job, id: once }) }), [201, { ok: true }], 'nothing is echoed back');
     assert.equal((await call('/api/enquiries/job', { body: json({ ...job, id: once, name: 'Changed' }) }))[0], 201, 'a retry still succeeds…');
     assert.equal((await call('/api/enquiries/guidance', { body: json(guide) }))[0], 201);
+    assert.equal((await call('/api/enquiries/guidance', { body: json({ ...guide, name: 'Dr Mira', requirement: '  ' }) }))[0], 201, 'the message is optional');
     assert.equal((await call('/api/admin/enquiries/job'))[0], 401);
     assert.equal((await call('/api/admin/enquiries/guidance', { headers: { Authorization: `Bearer ${token}x` } }))[0], 401);
     const [, jobs] = await call('/api/admin/enquiries/job', { headers: auth });
     assert.equal(jobs.length, 1, '…but is stored once, and never overwrites');
-    assert.deepEqual({ ...jobs[0], id: 0, date: 0 }, { id: 0, date: 0, kind: 'job', name: 'Dr Asha', qualification: 'MBBS', experience: 3, phone: '+919605500678', whatsapp: '9605500678', specialization: 'General Practice — DHA' });
+    assert.deepEqual({ ...jobs[0], id: 0, date: 0 }, { id: 0, date: 0, kind: 'job', name: 'Dr Asha', qualification: 'MBBS', experience: 3, phone: '+919605500678', specialization: 'General Practice — DHA' }, 'no whatsapp: contact number is the only phone');
     assert.ok(!Number.isNaN(Date.parse(jobs[0].date)));
     const [, guides] = await call('/api/admin/enquiries/guidance', { headers: auth });
-    assert.deepEqual(guides.map(g => [g.kind, g.requirement]), [['guidance', 'Which exam first?\nDHA or MOH']], 'each list holds only its own kind');
+    // two submissions can share a millisecond, so look each one up by name instead of relying on the newest-first order
+    const byName = Object.fromEntries(guides.map(g => [g.name, g]));
+    assert.deepEqual(guides.map(g => g.kind).sort().join(), 'guidance,guidance', 'each list holds only its own kind');
+    assert.equal(byName['Dr Mira'].requirement, '', 'the optional message may be empty');
+    assert.deepEqual({ ...byName['Dr Ravi'], id: 0, date: 0 }, { id: 0, date: 0, kind: 'guidance', name: 'Dr Ravi', qualification: 'MBBS', experience: 3, phone: '+919605500678', specialization: 'General Practice — DHA', requirement: 'Which exam first?\nDHA or MOH' }, 'every field is saved');
     assert.equal((await call('/api/admin/enquiries/nope', { headers: auth }))[0], 404);
     assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).enquiries[once], 'saved to the store, so it survives a restart');
 
