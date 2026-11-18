@@ -14,6 +14,13 @@ if (process.env.SKM_DEGRADED) {   // child run: unreachable DB, assert 200 + fal
     for (const p of ['/api/cms', '/api/cms/plans']) assert.equal((await fetch(b + p)).status, 200, `${p} must not 500`);
     const r = await fetch(b + '/api/cms/faqs', { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: '[]' });
     console.log(r.status, (await r.json()).storage);
+    // hosted (RENDER set, or NODE_ENV=production) without RESEND_API_KEY: no fixed OTP, no code in the response
+    const o = await fetch(b + '/api/auth/otp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'a@b.co' }) });
+    const ob = await o.json();
+    console.log('otp', o.status, 'devCode' in ob || 'devOtp' in ob || 'challenge' in ob ? 'leaked' : 'none');
+    // reviews never fall back: a visitor gets a real error, not a "thank you" for a review the inbox will never see
+    const rv = await fetch(b + '/api/reviews', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'X', rating: 5, body: 'Lovely course overall' }) });
+    console.log('review', rv.status);
     s.close();
   });
   return;
@@ -136,6 +143,50 @@ const server = require('./server').listen(0, async () => {
     assert.equal((await call(`/api/admin/review-inbox/${inbox[0].id}`, { headers: auth }, 'DELETE'))[0], 200);
     assert.deepEqual((await call('/api/admin/review-inbox', { headers: auth }))[1], []);
     assert.equal((await call(`/api/admin/review-inbox/${inbox[0].id}`, { headers: auth }, 'DELETE'))[0], 404);
+    // a re-sent form (same id) is stored once and can't overwrite a reviewed record; reject keeps it, unpublished
+    const rid = crypto.randomUUID(), sendRev = b => call('/api/reviews', { body: json({ name: 'Dr D', rating: 4, body: 'Very helpful mock tests', id: rid, ...b }) });
+    assert.equal((await sendRev())[0], 201);
+    assert.equal((await sendRev())[0], 201);
+    assert.equal((await call('/api/admin/review-inbox', { headers: auth }))[1].length, 1);
+    assert.equal((await call(`/api/admin/review-inbox/${rid}/reject`, {}, 'POST'))[0], 401);
+    assert.equal((await call(`/api/admin/review-inbox/${rid}/reject`, { headers: auth }, 'POST'))[0], 200);
+    assert.equal((await sendRev({ name: 'Mallory' }))[0], 201);
+    assert.deepEqual((await call('/api/admin/review-inbox', { headers: auth }))[1].map(r => [r.name, r.status]), [['Dr D', 'rejected']]);
+    assert.deepEqual((await call('/api/reviews'))[1].map(r => r.name), ['Dr B', 'Dr C']);
+
+    // approve is idempotent: a repeat, two at once, or a retry after a half-finished approve never adds a second card.
+    // Each visitor below gets its own forwarded address, so the per-IP review limit doesn't interfere.
+    const ip = n => ({ 'X-Forwarded-For': `203.0.113.${n}` });
+    const submit = (b, n) => call('/api/reviews', { body: json({ rating: 5, body: 'Clear and well structured lessons', ...b }), headers: ip(n) });
+    const cards = async () => (await call('/api/reviews'))[1].length;
+    const inboxId = async name => (await call('/api/admin/review-inbox', { headers: auth }))[1].find(r => r.name === name).id;
+    assert.equal((await submit({ name: 'Dr E' }, 1))[0], 201);
+    const idE = await inboxId('Dr E'), n0 = await cards();
+    const twice = await Promise.all([approve(idE), approve(idE)]);
+    assert.ok(twice.every(([st]) => st === 200 || st === 409) && twice.some(([st, b]) => st === 200 && !b.alreadyPublished), JSON.stringify(twice));
+    assert.equal(await cards(), n0 + 1, 'two approves at once publish one card');
+    const [stAgain, again] = await approve(idE);
+    assert.equal(stAgain, 200);
+    assert.equal(again.alreadyPublished, true);
+    assert.equal(await cards(), n0 + 1, 'approving a published review adds nothing');
+    assert.equal((await call(`/api/admin/review-inbox/${idE}/reject`, { headers: auth }, 'POST'))[0], 409, 'a published review is not rejected');
+    // published, but the submission never got marked approved (crash in between): the retry finds the card
+    assert.equal((await submit({ name: 'Dr F' }, 2))[0], 201);
+    const idF = await inboxId('Dr F');
+    const withF = [...(await call('/api/reviews'))[1], { name: 'Dr F', role: '', rating: 5, body: 'Clear and well structured lessons' }];
+    assert.equal((await call('/api/admin/reviews', { body: json(withF), headers: auth }, 'PUT'))[0], 200);
+    const [, retry] = await approve(idF);
+    assert.equal(retry.alreadyPublished, true);
+    assert.equal(await cards(), n0 + 2);
+    assert.equal((await call('/api/admin/review-inbox', { headers: auth }))[1].find(r => r.id === idF).status, 'approved');
+    assert.deepEqual((await call('/api/reviews'))[1].filter(r => r.name === 'Dr E' || r.name === 'Dr F').map(r => r.name), ['Dr E', 'Dr F'], 'existing cards are kept');
+
+    // rate limit: keyed on the address our (one, trusted) proxy appended — the rightmost X-Forwarded-For entry
+    for (let i = 0; i < 5; i++) assert.equal((await submit({ name: `Visitor ${i}` }, 50))[0], 201);
+    assert.equal((await submit({ name: 'Visitor 5' }, 50))[0], 429, 'the 6th review from one address waits 15 minutes');
+    assert.equal((await submit({ name: 'Someone else' }, 51))[0], 201, 'another visitor is not blocked');
+    const spoof = await call('/api/reviews', { body: json({ name: 'Spoof', rating: 5, body: 'Clear and well structured lessons' }), headers: { 'X-Forwarded-For': '198.51.100.7, 203.0.113.50' } });
+    assert.equal(spoof[0], 429, 'an address the client prepends itself is ignored');
 
     // Job Enquiry / Guidance Request: public submit, admin-only read, validated, a re-sent form stored once
     const jobBase = { name: ' Dr  Asha ', qualification: 'MBBS', experience: '3', phone: '+91 96055 00678', specialization: 'General Practice — DHA' };
@@ -273,10 +324,15 @@ const server = require('./server').listen(0, async () => {
     }
 
     // a dead database degrades to the fallback store — it must never 500 the admin UI
-    const degraded = require('node:child_process').execFileSync(process.execPath, [__filename], {
-      env: { ...process.env, SKM_DEGRADED: '1' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    const child = extra => require('node:child_process').execFileSync(process.execPath, [__filename], {
+      env: { ...process.env, SKM_DEGRADED: '1', ...extra }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     });
+    const degraded = child({ RENDER: 'true' });
     assert.match(degraded, /^200 fallback$/m, `degraded run returned: ${degraded}`);
+    assert.match(degraded, /^review 503$/m, `degraded review returned: ${degraded}`);
+    assert.match(degraded, /^otp 503 none$/m, `OTP on Render without RESEND_API_KEY: ${degraded}`);
+    assert.match(child({ NODE_ENV: 'production' }), /^otp 503 none$/m, 'OTP with NODE_ENV=production and no RESEND_API_KEY');
+    // the local dev/test run above (no RENDER, NODE_ENV=test) is the only place the fixed code works — see the OTP login checks
 
     console.log('ok — all checks passed');
   } catch (err) {

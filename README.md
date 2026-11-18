@@ -12,7 +12,7 @@ npm run dev               # http://localhost:4000
 npm test
 ```
 
-Without Razorpay keys, checkout is simulated. Without `RESEND_API_KEY`, the login code is `FALLBACK_OTP`. Without `ADMIN_EMAIL`/`ADMIN_PASSWORD`, the admin login is `admin@skmsacademy.com` / `AdminPass@2026` (development only).
+Without Razorpay keys, checkout is simulated. Without `RESEND_API_KEY`, the login code is `FALLBACK_OTP` (default 123456) — on a local machine only; on Render/Vercel or with `NODE_ENV=production` email OTP login answers 503 until the key is set. Without `ADMIN_EMAIL`/`ADMIN_PASSWORD`, the admin login is `admin@skmsacademy.com` / `AdminPass@2026` (development only).
 
 ## Deploy (Render)
 

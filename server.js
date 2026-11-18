@@ -225,6 +225,8 @@ function pgStore(connectionString) {
     // web_reviews for the same reason: keep clear of any `reviews` table the app backend may own
     delReview: id => q('DELETE FROM web_reviews WHERE id = $1', [id]),
     putReview: r => q('INSERT INTO web_reviews (id, data, status) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET data = $2, status = $3', [r.id, JSON.stringify(r), r.status]),
+    // visitor submissions: insert-only, so a re-sent form is stored once and can never overwrite a reviewed record
+    addReview: r => q('INSERT INTO web_reviews (id, data, status) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [r.id, JSON.stringify(r), r.status]),
     listSubmissions: async () => (await q('SELECT data FROM web_reviews ORDER BY created_at DESC LIMIT 500')).map(r => r.data),
     // DO NOTHING: a re-sent form (double click, retry after a timeout) carries the same id and is stored once
     putEnquiry: e => q('INSERT INTO web_enquiries (id, kind, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [e.id, e.kind, JSON.stringify(e)]),
@@ -279,6 +281,7 @@ function fileStore(file) {
     putUser: u => write(d => { (d.users ??= {})[u.email] = u; }),
     markSubscribed: email => write(d => { if (d.users?.[email]) d.users[email].is_subscribed = true; }),
     putReview: r => write(d => { (d.reviews ??= {})[r.id] = r; }),
+    addReview: r => write(d => { (d.reviews ??= {})[r.id] ??= r; }),
     delReview: id => write(d => { delete d.reviews?.[id]; }),
     listSubmissions: async () => Object.values((await load()).reviews || {}).sort((a, b) => String(b.date).localeCompare(String(a.date))),
     putEnquiry: e => write(d => { (d.enquiries ??= {})[e.id] ??= e; }),
@@ -396,7 +399,22 @@ async function syncAppAccess(enrollment) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);   // Render/Vercel sit behind one proxy; needed for req.ip
+/* req.ip (the rate-limit key) = the address the last PROXY_HOPS proxies saw, i.e. the rightmost forwarded entries.
+   Never `true`: that would take the leftmost X-Forwarded-For entry, which any client can write. A client that prepends
+   its own entries still gets the address our proxy appended. Default 1 (Render's load balancer); TRUST_PROXY_HOPS
+   (an integer 0–5) corrects it if the logged header depth below shows more hops. */
+const PROXY_HOPS = /^[0-5]$/.test(env.TRUST_PROXY_HOPS ?? '') ? Number(env.TRUST_PROXY_HOPS) : 1;
+app.set('trust proxy', PROXY_HOPS);
+// once per process: how many addresses the platform's X-Forwarded-For carries (a count only — no IPs are logged)
+let proxyLogged = false;
+app.use((req, res, next) => {
+  if (!proxyLogged && PROD) {
+    proxyLogged = true;
+    const n = String(req.get('x-forwarded-for') || '').split(',').filter(s => s.trim()).length;
+    console.log(`[proxy] trust proxy = ${PROXY_HOPS} hop(s); first request's X-Forwarded-For has ${n} entr${n === 1 ? 'y' : 'ies'}`);
+  }
+  next();
+});
 
 /* CORS: only the two front ends may call the API from a browser. CLIENT_URL / ADMIN_URL take a comma-separated
    list (e.g. the Vercel production domain plus a custom one). The Vite dev servers are allowed too — in production
@@ -470,7 +488,16 @@ function strike(key) {   // 5 strikes → 15-minute lockout
   attempts.set(key, a);
 }
 const TOO_MANY = { error: 'Too many attempts — try again in 15 minutes' };
-const FALLBACK_OTP = env.FALLBACK_OTP || '123456';   // used only while RESEND_API_KEY is unset
+/* Email OTP needs RESEND_API_KEY. Without it, a fixed code (FALLBACK_OTP, default 123456) is accepted — but only on a
+   developer's machine or in the test suite: never with NODE_ENV=production and never on a hosted platform (Render sets
+   RENDER, Vercel VERCEL, Lambda AWS_LAMBDA_FUNCTION_NAME), whatever NODE_ENV says. Hosted without the key, OTP login
+   answers 503 — a predictable code would let anyone sign in as any email. */
+const HOSTED = PROD || !!(env.RENDER || SERVERLESS);
+const MAIL_OTP = !!env.RESEND_API_KEY;
+const FALLBACK_OTP = !MAIL_OTP && !HOSTED ? (env.FALLBACK_OTP || '123456') : null;
+if (!MAIL_OTP) console[HOSTED ? 'error' : 'warn'](HOSTED
+  ? '[auth] RESEND_API_KEY not set — email OTP login is DISABLED (503) until it is configured'
+  : '[auth] RESEND_API_KEY not set — local development: the fixed FALLBACK_OTP code is accepted');
 const GOOGLE_CLIENT_ID = env.GOOGLE_CLIENT_ID || '';
 // Read for completeness / a future server-side auth-code exchange. The GIS ID-token flow below is
 // public-client only: the browser never sees this and Google does the signature check, so it is unused.
@@ -520,17 +547,17 @@ app.post('/api/auth/otp', async (req, res) => {
   const email = String(req.body?.email ?? '').trim().toLowerCase();
   if (email.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
 
+  if (!MAIL_OTP && !FALLBACK_OTP) return res.status(503).json({ error: 'Email login is not available right now — please use Continue with Google, or try again later.' });
+
   strike(key);   // every code sent counts toward the lockout, so this can't be used to flood an inbox
-  // ponytail: no mail provider -> a fixed, publicly known code logs anyone in as any email address.
-  // That is deliberate for the review/testing window. Set RESEND_API_KEY to switch to real random codes.
-  const code = env.RESEND_API_KEY ? String(crypto.randomInt(1e6)).padStart(6, '0') : FALLBACK_OTP;
-  if (env.RESEND_API_KEY && !(await sendOtpEmail(email, code))) return res.status(502).json({ error: 'Could not send the OTP email — please try again' });
+  const code = MAIL_OTP ? String(crypto.randomInt(1e6)).padStart(6, '0') : FALLBACK_OTP;
+  if (MAIL_OTP && !(await sendOtpEmail(email, code))) return res.status(502).json({ error: 'Could not send the OTP email — please try again' });
   res.json({
     ok: true,
     message: 'Code sent',
     challenge: seal({ email, exp: Date.now() + 10 * 60e3 }, `otp:${code}:`),
     // devOtp is the older name for the same field — kept so existing callers and the smoke test keep working
-    ...(env.RESEND_API_KEY ? {} : { devCode: code, devOtp: code }),
+    ...(MAIL_OTP ? {} : { devCode: code, devOtp: code }),   // local development / tests only (see FALLBACK_OTP)
   });
 });
 
@@ -601,18 +628,35 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 /* "Write A Review" submissions from visitors: kept in web_reviews, never published as sent — the admin reads them in
-   the Review Inbox and approves (optionally after editing) the good ones into Student Reviews, the list below. */
+   the Review Inbox and approves (optionally after editing) the good ones into Student Reviews, the list below.
+   status: pending (new) → approved (published) or rejected (kept, never published).
+   Submissions and the inbox use the primary store directly, never the /tmp fallback: a review saved to a disk that is
+   wiped on the next deploy (and that the inbox never reads) is a review lost behind a fake "thank you". */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REVIEWS_DOWN = { error: 'We could not reach the review store just now — please try again in a minute.' };
+// → the result of fn, or undefined after answering 503
+async function onPrimary(res, fn) {
+  try { return await fn(); } catch (err) {
+    console.error('[reviews] database error:', err.message);
+    res.status(503).json(REVIEWS_DOWN);
+  }
+}
+const findSubmission = async id => (await primary.listSubmissions()).find(r => r.id === id);
+
 app.post('/api/reviews', async (req, res) => {
   const key = 'review:' + req.ip;
   if (blocked(key)) return res.status(429).json(TOO_MANY);
-  const name = String(req.body?.name ?? '').trim(), body = String(req.body?.body ?? '').trim();
+  const name = String(req.body?.name ?? '').replace(/\s+/g, ' ').trim(), body = String(req.body?.body ?? '').trim();
   const rating = Number(req.body?.rating);
-  if (!name || name.length > 80 || body.length < 10 || body.length > 2000 || !Number.isInteger(rating) || rating < 1 || rating > 5) {
-    return res.status(400).json({ error: 'Please add your name, a star rating and a review of at least 10 characters' });
-  }
-  strike(key);   // 5 reviews per IP, then a 15-minute pause
-  await db.putReview({ id: crypto.randomUUID(), name, rating, body, date: new Date().toISOString(), status: 'pending' });
-  res.status(201).json({ ok: true });
+  if (!name || name.length > 80) return res.status(400).json({ error: 'Please enter your name (up to 80 characters).' });
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Please pick a star rating from 1 to 5.' });
+  if (body.length < 10 || body.length > 2000) return res.status(400).json({ error: 'Please write a review of 10 to 2000 characters.' });
+  // the form sends one random id per fill-in, so a double submit or a retry after a timeout is stored once
+  const id = UUID.test(req.body?.id) ? req.body.id.toLowerCase() : crypto.randomUUID();
+  const saved = await onPrimary(res, () => primary.addReview({ id, name, rating, body, date: new Date().toISOString(), status: 'pending' }).then(() => true));
+  if (!saved) return;
+  strike(key);   // 5 reviews per IP, then a 15-minute pause (only saved ones count)
+  res.status(201).json({ ok: true, id, status: 'pending' });
 });
 
 /* Student reviews ("What Our Students Say"): one list the admin edits, stored as the `reviews` CMS section.
@@ -632,21 +676,52 @@ async function saveReviews(res, list) {
 }
 
 app.get('/api/reviews', async (req, res) => res.json(await readReviews()));
-app.get('/api/admin/review-inbox', requireAdmin, async (req, res) =>
-  res.json((await db.listSubmissions()).map(({ id, name, rating, body, date, status }) => ({ id, name, rating, body, date, status }))));
-// approve: the body may carry the admin's edits (name, role, rating, body); the submission is kept, marked approved
+app.get('/api/admin/review-inbox', requireAdmin, async (req, res) => {
+  const list = await onPrimary(res, () => primary.listSubmissions());
+  if (list) res.json(list.map(({ id, name, rating, body, date, status }) => ({ id, name, rating, body, date, status: status || 'pending' })));
+});
+/* approve: the body may carry the admin's edits (name, role, rating, body); the submission is kept, marked approved.
+   Idempotent — one submission is one card, however often approve is sent:
+   - an already-approved submission is answered 200 { alreadyPublished } and nothing is written;
+   - a second approve of the same id while the first is still running is refused (double click, two admin tabs);
+   - a card with the same name and text already on the list is never added twice. The card is published first and the
+     submission marked approved second, so a failure in between leaves it pending, and the retry finds the card. */
+const approving = new Set();   // ponytail: per-instance lock; fine for one Render instance
+const sameCard = (a, b) => [a.name, a.body].join('\n').trim().toLowerCase() === [b.name, b.body].join('\n').trim().toLowerCase();
 app.post('/api/admin/review-inbox/:id/approve', requireAdmin, async (req, res) => {
-  const sub = (await db.listSubmissions()).find(r => r.id === req.params.id);
+  const id = req.params.id;
+  if (approving.has(id)) return res.status(409).json({ error: 'This review is already being published — refresh in a moment.' });
+  approving.add(id);
+  try {
+    const sub = await onPrimary(res, () => findSubmission(id).then(s => s || null));
+    if (sub === undefined) return;
+    if (!sub) return res.status(404).json({ error: 'Review not found' });
+    if (sub.status === 'approved') return res.json({ ok: true, alreadyPublished: true, reviews: await readReviews() });
+    const review = cleanReview({ name: sub.name, role: '', rating: sub.rating, body: sub.body, ...req.body });
+    if (!review) return res.status(400).json({ error: 'Each review needs a name, a 1–5 star rating and review text' });
+    const list = await readReviews(), already = list.some(r => sameCard(r, review) || sameCard(r, sub));
+    const next = already ? list : [...list, review];
+    if (!already) await db.setCms('reviews', next);
+    if (!(await onPrimary(res, () => primary.putReview({ ...sub, status: 'approved' }).then(() => true)))) return;
+    res.json({ ok: true, alreadyPublished: already, reviews: next, storage: dbDown ? 'fallback' : 'db',
+      warning: dbDown ? 'Saved locally only — the database is unreachable, so this change may not survive a restart.' : undefined });
+  } finally {
+    approving.delete(id);
+  }
+});
+// reject: kept in the inbox as rejected, never published. A published review is removed from Student Reviews instead.
+app.post('/api/admin/review-inbox/:id/reject', requireAdmin, async (req, res) => {
+  const sub = await onPrimary(res, () => findSubmission(req.params.id).then(s => s || null));
+  if (sub === undefined) return;
   if (!sub) return res.status(404).json({ error: 'Review not found' });
-  const review = cleanReview({ name: sub.name, role: '', rating: sub.rating, body: sub.body, ...req.body });
-  if (!review) return res.status(400).json({ error: 'Each review needs a name, a 1–5 star rating and review text' });
-  await db.putReview({ ...sub, status: 'approved' });
-  saveReviews(res, [...await readReviews(), review]);
+  if (sub.status === 'approved') return res.status(409).json({ error: 'This review is already published — remove it from Student Reviews instead.' });
+  if (await onPrimary(res, () => primary.putReview({ ...sub, status: 'rejected' }).then(() => true))) res.json({ ok: true });
 });
 app.delete('/api/admin/review-inbox/:id', requireAdmin, async (req, res) => {
-  if (!(await db.listSubmissions()).some(r => r.id === req.params.id)) return res.status(404).json({ error: 'Review not found' });
-  await db.delReview(req.params.id);
-  res.json({ ok: true });
+  const sub = await onPrimary(res, () => findSubmission(req.params.id).then(s => s || null));
+  if (sub === undefined) return;
+  if (!sub) return res.status(404).json({ error: 'Review not found' });
+  if (await onPrimary(res, () => primary.delReview(req.params.id).then(() => true))) res.json({ ok: true });
 });
 /* Job Enquiry (hero button) and Guidance Request (Contact page) forms. Public: submit only — nothing is ever read back
    publicly. Admin: the two lists. Stored on the primary store directly, never the /tmp fallback: a lead saved to a disk
@@ -685,7 +760,7 @@ app.post('/api/enquiries/:kind', enquiryKind, async (req, res) => {
   if (error) return res.status(400).json({ error });
   strike(key);   // 5 enquiries per IP, then a 15-minute pause
   // the form sends one random id per fill-in, so a double submit or a retry after a timeout is stored once
-  const id = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.body?.id) ? req.body.id.toLowerCase() : crypto.randomUUID();
+  const id = UUID.test(req.body?.id) ? req.body.id.toLowerCase() : crypto.randomUUID();
   try {
     await primary.putEnquiry({ id, kind: req.params.kind, ...data, date: new Date().toISOString() });
   } catch (err) {
