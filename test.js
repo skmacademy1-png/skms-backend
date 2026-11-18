@@ -219,6 +219,14 @@ const server = require('./server').listen(0, async () => {
     assert.deepEqual({ ...byName['Dr Ravi'], id: 0, date: 0 }, { id: 0, date: 0, kind: 'guidance', name: 'Dr Ravi', qualification: 'MBBS', experience: 3, phone: '+919605500678', specialization: 'General Practice — DHA', requirement: 'Which exam first?\nDHA or MOH' }, 'every field is saved');
     assert.equal((await call('/api/admin/enquiries/nope', { headers: auth }))[0], 404);
     assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).enquiries[once], 'saved to the store, so it survives a restart');
+    const del = (kind, id, headers = auth) => call(`/api/admin/enquiries/${kind}/${id}`, { headers }, 'DELETE');
+    assert.equal((await del('job', jobs[0].id, {}))[0], 401, 'delete is admin-only');
+    assert.equal((await del('guidance', jobs[0].id))[0], 404, 'a job enquiry cannot be deleted through the guidance list');
+    assert.deepEqual(await del('job', jobs[0].id), [200, { ok: true }]);
+    assert.equal((await del('job', jobs[0].id))[0], 404, 'already gone');
+    assert.equal((await call('/api/admin/enquiries/job', { headers: auth }))[1].length, 0);
+    assert.equal((await call('/api/admin/enquiries/guidance', { headers: auth }))[1].length, 2, 'the other list is untouched');
+    assert.ok(!JSON.parse(fs.readFileSync(file, 'utf8')).enquiries[once], 'the delete reaches the store');
 
     // student OTP login (no mail key outside production → the code comes back as devOtp)
     assert.equal((await call('/api/auth/otp', { body: json({ email: 'bad' }) }))[0], 400);

@@ -231,6 +231,8 @@ function pgStore(connectionString) {
     // DO NOTHING: a re-sent form (double click, retry after a timeout) carries the same id and is stored once
     putEnquiry: e => q('INSERT INTO web_enquiries (id, kind, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING', [e.id, e.kind, JSON.stringify(e)]),
     listEnquiries: async kind => (await q('SELECT data FROM web_enquiries WHERE kind = $1 ORDER BY created_at DESC LIMIT 1000', [kind])).map(r => r.data),
+    // → true when a row was removed; kind in the WHERE so one list's delete can never reach the other's rows
+    delEnquiry: async (kind, id) => (await q('DELETE FROM web_enquiries WHERE id = $1 AND kind = $2 RETURNING id', [id, kind])).length > 0,
   };
 }
 
@@ -286,6 +288,11 @@ function fileStore(file) {
     listSubmissions: async () => Object.values((await load()).reviews || {}).sort((a, b) => String(b.date).localeCompare(String(a.date))),
     putEnquiry: e => write(d => { (d.enquiries ??= {})[e.id] ??= e; }),
     listEnquiries: async kind => Object.values((await load()).enquiries || {}).filter(e => e.kind === kind).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+    delEnquiry: async (kind, id) => {
+      let found = false;
+      await write(d => { if (d.enquiries?.[id]?.kind === kind) found = delete d.enquiries[id]; });
+      return found;
+    },
   };
 }
 
@@ -724,7 +731,7 @@ app.delete('/api/admin/review-inbox/:id', requireAdmin, async (req, res) => {
   if (await onPrimary(res, () => primary.delReview(req.params.id).then(() => true))) res.json({ ok: true });
 });
 /* Job Enquiry (hero button) and Guidance Request (Contact page) forms. Public: submit only — nothing is ever read back
-   publicly. Admin: the two lists. Stored on the primary store directly, never the /tmp fallback: a lead saved to a disk
+   publicly. Admin: the two lists, and delete. Stored on the primary store directly, never the /tmp fallback: a lead saved to a disk
    that is wiped on the next deploy is a lead lost, so a database outage answers 503 and the visitor can retry.
    [field, label, rule, optional]: a number = max length, 'phone' = 7–15 digits, 'years' = 0–60, 'multi' = up to 1000 chars, newlines kept */
 const JOB_FIELDS = [['name', 'full name', 80], ['qualification', 'qualification', 120], ['experience', 'years of experience', 'years'],
@@ -774,6 +781,15 @@ app.get('/api/admin/enquiries/:kind', requireAdmin, enquiryKind, async (req, res
     res.json(await primary.listEnquiries(req.params.kind));
   } catch (err) {
     console.error('[enquiry] list failed:', err.message);
+    res.status(503).json({ error: 'The database is unreachable — try again in a minute.' });
+  }
+});
+app.delete('/api/admin/enquiries/:kind/:id', requireAdmin, enquiryKind, async (req, res) => {
+  try {
+    if (!await primary.delEnquiry(req.params.kind, req.params.id)) return res.status(404).json({ error: 'Enquiry not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[enquiry] delete failed:', err.message);
     res.status(503).json({ error: 'The database is unreachable — try again in a minute.' });
   }
 });
