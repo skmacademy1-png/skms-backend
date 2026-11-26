@@ -316,9 +316,11 @@ const server = require('./server').listen(0, async () => {
     globalThis.fetch = (url, opts) => String(url).startsWith('https://api.razorpay.com/') ? (rzpOrder = JSON.parse(opts.body),
       Promise.resolve(new Response(json({ id: 'order_DB1', amount: rzpOrder.amount, currency: rzpOrder.currency }), { status: 200 }))) : realFetch(url, opts);
     try {
-      const buy = body => call('/api/payments/order', { body: json({ planId: 'gp', name: 'A', phone: '9876543210', ...body }), headers: student });
+      const buy = body => call('/api/payments/order', { body: json({ planId: 'gp', exam: 'OMSB Exam', name: 'A', phone: '9876543210', ...body }), headers: student });
+      assert.equal((await buy({ index: 1, planRef: 15, exam: 'Mars Exam' }))[0], 400, 'an exam that is not on the list is refused');
       assert.equal((await buy({ index: 1, planRef: 15 }))[0], 200);
-      assert.equal((await call('/api/checkout/razorpay', { body: json({ planId: 'gp', index: 1, planRef: 15, name: 'A' }), headers: student }))[0], 200, 'the checkout alias creates the same order');
+      assert.equal(rzpOrder.notes.plan, 'GP License Exam — OMSB Exam — Plan B', 'the chosen exam is on the order');
+      assert.equal((await call('/api/checkout/razorpay', { body: json({ planId: 'gp', exam: 'DHA (Dubai) Exam', index: 1, planRef: 15, name: 'A' }), headers: student }))[0], 200, 'the checkout alias creates the same order');
       assert.deepEqual([rzpOrder.amount, rzpOrder.currency], [9500, 'USD'], 'charged $95 (the saved database price) in cents, in USD');
       assert.equal((await buy({ index: 1, planRef: 14 }))[0], 409, 'the page showed a different plan: refuse, never charge the wrong one');
     } finally {

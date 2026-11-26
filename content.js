@@ -114,7 +114,26 @@ function withAppPlans(groups, rows) {
   });
 }
 
-const planLabel = (group, card) => [group.label, card.name || card.duration].filter(Boolean).join(' — ');
+/* What a program's checkout asks before its plans, in order (payment.pdf). Copied in skms-frontend/src/lib/content.js. */
+const CHOICES = {
+  gp: { exam: ['DHA (Dubai) Exam', 'DoH/ HAAD Exam (Abu Dhabi)', 'UAE MOHAP Exam', 'SHA (Sharjah Health Authority) Exam', 'Kuwait prometric exam', 'SMLE(Saudi Exam)', 'OMSB Exam', 'QCHP Exam', 'NHRA Exam(Bahrain)'] },
+  specialist: {
+    specialty: ['Internal Medicine', 'Dermatology', 'Obstetrics and Gynaecology', 'Pediatrics', 'Ophthalmology', 'ENT'],
+    exam: ['KMLE', 'DHA', 'HAAD/DoH', 'SHA', 'MOHAP', 'QCHP', 'SMLE', 'OMSB', 'NHRA'],
+  },
+};
+// the buyer's choices for a program, in order; null when one is missing or not on the list
+const pickChoices = (programId, body = {}) => {
+  const out = [];
+  for (const [k, list] of Object.entries(CHOICES[programId] || {})) {
+    if (!list.includes(body[k])) return null;
+    out.push(body[k]);
+  }
+  return out;
+};
+
+// "GP Gulf Licensing Examination — DHA (Dubai) Exam — Plan A"
+const planLabel = (group, card, choices = []) => [group.label, ...choices, card.name || card.duration].filter(Boolean).join(' — ');
 
 /* buyer details on a checkout order */
 function cleanBuyer({ name, email, phone } = {}) {
@@ -138,4 +157,4 @@ function cleanReview({ name, role, rating, body } = {}) {
   return ok ? { name, role, rating, body } : null;
 }
 
-module.exports = { DEFAULTS, planLabel, cleanBuyer, cleanReview, withAppPlans };
+module.exports = { DEFAULTS, CHOICES, pickChoices, planLabel, cleanBuyer, cleanReview, withAppPlans };

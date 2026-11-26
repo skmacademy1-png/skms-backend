@@ -10,7 +10,7 @@ const express = require('express');
 // Variables already set (even empty) win over the file.
 try { process.loadEnvFile(path.join(__dirname, '.env')); } catch {}
 
-const { DEFAULTS, planLabel, cleanBuyer, cleanReview, withAppPlans } = require('./content.js');
+const { DEFAULTS, pickChoices, planLabel, cleanBuyer, cleanReview, withAppPlans } = require('./content.js');
 
 const env = process.env;
 const PROD = env.NODE_ENV === 'production';
@@ -372,13 +372,13 @@ async function sitePlans() {
   return withAppPlans(saved?.length ? saved : DEFAULTS.plans, await appPlanRows());
 }
 
-async function findPlan(programId, index, planRef) {
+async function findPlan(programId, index, planRef, choices = []) {
   const group = (await sitePlans()).find(g => g.id === programId), card = group?.cards?.[index];
   if (!card || !(Number(card.price) > 0)) return null;
   // the page sent the plan id it showed: if the list changed since, refuse rather than charge for a different plan
   if (planRef && card.planId !== planRef) return { stale: true };
   const app = card.planId && group.courseId ? { courseId: group.courseId, planId: card.planId, days: card.durationDays } : null;
-  return { label: planLabel(group, card), price: Number(card.price), app };
+  return { label: planLabel(group, card, choices), price: Number(card.price), app };
 }
 
 /* Paid plan -> access in the mobile app. Runs once per enrollment (the result is kept on it) and never
@@ -925,7 +925,10 @@ app.post(['/api/checkout/razorpay', '/api/payments/order'], async (req, res) => 
   const { planId, index, planRef } = req.body || {};
   const buyer = cleanBuyer({ ...req.body, email: user.email });   // enrollment is bound to the verified account, never the form's email
   if (!buyer) return res.status(400).json({ error: 'Please enter a valid name and phone number' });
-  const plan = await findPlan(planId, Number(index), Number(planRef) || undefined);
+  const choices = pickChoices(planId, req.body);   // GP: exam; Specialist: specialty + exam
+  if (!choices) return res.status(400).json({ error: 'Please choose your specialty and exam before paying' });
+  const { specialty, exam } = req.body;
+  const plan = await findPlan(planId, Number(index), Number(planRef) || undefined, choices);
   if (!plan) return res.status(404).json({ error: 'That plan is no longer available' });
   if (plan.stale) return res.status(409).json({ error: 'Plans were just updated — please refresh the page and try again' });
   await db.putUser({ ...(await db.getUser(user.email)), ...buyer });   // prefills the next checkout, on any device
@@ -933,7 +936,7 @@ app.post(['/api/checkout/razorpay', '/api/payments/order'], async (req, res) => 
   const currency = RZP_CURRENCY;
   if (MOCK_PAY) {   // test order goes straight into enrollments as Success, no gateway call
     const ref = Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString('hex').toUpperCase();
-    const enrollment = await syncAppAccess({ id: 'order_MOCK' + ref, paymentId: 'pay_MOCK' + ref, ...buyer, planId, index: Number(index), app: plan.app, plan: plan.label, price: plan.price, currency, date: new Date().toISOString(), status: 'Success' });
+    const enrollment = await syncAppAccess({ id: 'order_MOCK' + ref, paymentId: 'pay_MOCK' + ref, ...buyer, planId, index: Number(index), app: plan.app, plan: plan.label, ...(specialty && { specialty }), ...(exam && { exam }), price: plan.price, currency, date: new Date().toISOString(), status: 'Success' });
     await db.putEnrollment(enrollment);
     return res.json({ mock: true, enrollment });
   }
@@ -943,7 +946,7 @@ app.post(['/api/checkout/razorpay', '/api/payments/order'], async (req, res) => 
       Authorization: RZP_AUTH,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ amount: Math.round(plan.price * 100), currency, receipt: `skm_${Date.now()}`, notes: { plan: plan.label, email: buyer.email } }),
+    body: JSON.stringify({ amount: Math.round(plan.price * 100), currency, receipt: `skm_${Date.now()}`, notes: { plan: plan.label, email: buyer.email, ...(specialty && { specialty }), ...(exam && { exam }) } }),
     signal: AbortSignal.timeout(15000),
   });
   const rzOrder = await rp.json();
@@ -953,7 +956,7 @@ app.post(['/api/checkout/razorpay', '/api/payments/order'], async (req, res) => 
   }
 
   // planId/index ride along on the enrollment so the app-access sync can map it after payment
-  await db.putEnrollment({ id: rzOrder.id, ...buyer, planId, index: Number(index), app: plan.app, plan: plan.label, price: plan.price, currency, date: new Date().toISOString(), status: 'Pending' });
+  await db.putEnrollment({ id: rzOrder.id, ...buyer, planId, index: Number(index), app: plan.app, plan: plan.label, ...(specialty && { specialty }), ...(exam && { exam }), price: plan.price, currency, date: new Date().toISOString(), status: 'Pending' });
   res.json({ orderId: rzOrder.id, keyId: RZP_KEY_ID, amount: rzOrder.amount, currency: rzOrder.currency });
 });
 
