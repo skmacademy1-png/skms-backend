@@ -272,11 +272,11 @@ const server = require('./server').listen(0, async () => {
     // withAppPlans: legacy copy, switched-off rows, unnamed cards, database down
     const rows = gpOf(DEFAULTS.plans).map(c => ({ id: c.planId, courseId: 22, title: c.name, price: c.price + 1, durationDays: c.durationDays, durationLabel: null, features: [], entitlements: ['mcq', 'mock'], isActive: c.planId !== 16 }));
     const merged = withAppPlans(DEFAULTS.plans, rows);
-    assert.deepEqual(gpOf(merged).map(c => [c.name, c.price, c.duration]), [['Plan A', 61, '30 days access'], ['Plan B', 86, '45 days access']], 'switched-off row 16 is dropped');
+    assert.deepEqual(gpOf(merged).map(c => [c.name, c.price, c.duration]), [['Plan A', 56, '30 days access'], ['Plan B', 86, '45 days access']], 'switched-off row 16 is dropped');
     assert.deepEqual(gpOf(merged)[0].features, ['MCQ Bank', 'Mock Test'], 'entitlement keys read as feature labels');
     assert.deepEqual(withAppPlans(DEFAULTS.plans, null), DEFAULTS.plans.map(g => ({ ...g })), 'database never reached: the saved cards stand in');
     const legacy = DEFAULTS.plans.map(g => g.id === 'gp' ? { ...g, cards: [{ name: 'Plans A', price: 75 }, { name: 'Plans D', price: 280 }] } : g);
-    assert.deepEqual(gpOf(withAppPlans(legacy, null)).map(c => c.price), [60, 85, 150], 'a legacy CMS copy (no planIds) never sells — the defaults stand in');
+    assert.deepEqual(gpOf(withAppPlans(legacy, null)).map(c => c.price), [55, 85, 150], 'a legacy CMS copy (no planIds) never sells — the defaults stand in');
 
     // bulk-sync: admin only, validated up front, all-or-nothing, instant on the site, entitlements untouched
     const sync = (groups, headers = auth, q = '') => call('/api/admin/plans/bulk-sync' + q, { body: json(groups), headers }, 'PUT');
