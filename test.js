@@ -323,6 +323,14 @@ const server = require('./server').listen(0, async () => {
       assert.equal((await call('/api/checkout/razorpay', { body: json({ planId: 'gp', exam: 'DHA (Dubai) Exam', index: 1, planRef: 15, name: 'A' }), headers: student }))[0], 200, 'the checkout alias creates the same order');
       assert.deepEqual([rzpOrder.amount, rzpOrder.currency], [9500, 'USD'], 'charged $95 (the saved database price) in cents, in USD');
       assert.equal((await buy({ index: 1, planRef: 14 }))[0], 409, 'the page showed a different plan: refuse, never charge the wrong one');
+      // every card on the Plans page charges exactly the price it shows (payment.pdf prices, incl. AI $149 early bird)
+      const pick = { gp: { exam: 'DHA (Dubai) Exam' }, specialist: { specialty: 'ENT', exam: 'KMLE' } };
+      for (const g of (await call('/api/plans/live'))[1].plans) {
+        for (const [i, c] of g.cards.entries()) {
+          assert.equal((await buy({ planId: g.id, ...pick[g.id], index: i, planRef: c.planId }))[0], 200, `${g.id} #${c.planId} checks out`);
+          assert.equal(rzpOrder.amount, Math.round(c.price * 100), `${g.id} #${c.planId}: charged ${rzpOrder.amount / 100}, shown ${c.price}`);
+        }
+      }
     } finally {
       globalThis.fetch = realFetch;
     }
