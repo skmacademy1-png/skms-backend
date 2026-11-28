@@ -229,6 +229,7 @@ const server = require('./server').listen(0, async () => {
     assert.ok(!JSON.parse(fs.readFileSync(file, 'utf8')).enquiries[once], 'the delete reaches the store');
 
     // student OTP login (no mail key outside production → the code comes back as devOtp)
+    assert.equal((await call('/api/config'))[1].emailLogin, true, 'the login modal offers email when a code can be issued');
     assert.equal((await call('/api/auth/otp', { body: json({ email: 'bad' }) }))[0], 400);
     const [, otp] = await call('/api/auth/otp', { body: json({ email: 'Doc@Test.co' }) });
     const wrong = String((Number(otp.devOtp) + 1) % 1e6).padStart(6, '0');

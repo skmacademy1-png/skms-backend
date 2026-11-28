@@ -37,6 +37,7 @@ const MOCK_PAY = !RZP_KEY_ID || !RZP_KEY_SECRET;   // no keys -> simulated check
 console.log(MOCK_PAY
   ? '[pay] RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not set — using the simulated checkout'
   : `[pay] Razorpay ready — ${RZP_KEY_ID} (${RZP_CURRENCY})`);
+if (PROD && RZP_KEY_ID.startsWith('rzp_test_')) console.error('[pay] NODE_ENV=production but RAZORPAY_KEY_ID is a TEST key — no real money is collected');
 
 /* ---------------- storage: Postgres when DATABASE_URL is set, else a JSON file ---------------- */
 
@@ -461,7 +462,8 @@ app.get('/api/health', (req, res) => res.json({ ok: true, storage: dbDown ? 'fal
 
 // Public front-end config. The OAuth client ID is a public value by design (it ships in every GIS
 // page); the client SECRET is never sent here. Lets every page find it without a per-page meta tag.
-app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID }));
+// emailLogin: false when OTP mail isn't configured (hosted without RESEND_API_KEY) — the login modal then offers Google only
+app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailLogin: MAIL_OTP || !!FALLBACK_OTP }));
 app.get('/api/auth/google/client-id', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID }));
 
 // Razorpay webhook needs the raw body for its signature, so it's registered before express.json()
